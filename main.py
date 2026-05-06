@@ -34,13 +34,14 @@ try:
     from safety_service import SafetyService
     from learning_service import LearningService
     from motorcycle_360_vision import Motorcycle360Vision
-    from surround_vision_renderer import SurroundVisionRenderer
+    from surround_vision_renderer import SurroundVisionRenderer, DetectedObject
 except ImportError:
     AnalyticsService = None
     SafetyService = None
     LearningService = None
     Motorcycle360Vision = None
     SurroundVisionRenderer = None
+    DetectedObject = None
 
 from rag_enhanced_detection import rag_enhancer
 from ensemble_detection import ensemble_system
@@ -1680,7 +1681,6 @@ async def render_surround_vision(
         # Convert detected objects to proper format
         detected_objects = []
         for obj_data in request.detected_objects:
-            from surround_vision_renderer import DetectedObject
             detected_objects.append(DetectedObject(
                 label=obj_data.get('label', 'unknown'),
                 confidence=obj_data.get('confidence', 0.5),
@@ -1716,7 +1716,6 @@ def render_surround_vision_mock(request: SurroundVisionRequest):
         # Convert detected objects to proper format
         detected_objects = []
         for obj_data in request.detected_objects:
-            from surround_vision_renderer import DetectedObject
             detected_objects.append(DetectedObject(
                 label=obj_data.get('label', 'unknown'),
                 confidence=obj_data.get('confidence', 0.5),
