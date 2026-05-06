@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -147,6 +147,14 @@ class TripSnapshot(BaseModel):
     safe_frames: int
     near_miss_count: int
     trip_elapsed_s: float
+
+
+class SurroundVisionRequest(BaseModel):
+    """Request for surround vision scene generation"""
+    road_type: str = "urban"
+    speed: float = 0.0
+    turn_direction: str = "straight"
+    detected_objects: List[Dict[str, Any]] = []
 
 
 class TripEventOut(BaseModel):
@@ -1649,13 +1657,6 @@ def get_motorcycle_360_status():
     }
 
 # Surround Vision Renderer Endpoints
-
-class SurroundVisionRequest(BaseModel):
-    """Request for surround vision scene generation"""
-    road_type: str = "urban"
-    speed: float = 0.0
-    turn_direction: str = "straight"
-    detected_objects: List[Dict[str, Any]] = []
 
 @app.post("/surround-vision/render")
 async def render_surround_vision(
