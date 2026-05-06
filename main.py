@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -28,6 +28,14 @@ try:
 except Exception:  # pragma: no cover
     YOLO = None
 
+from rag_enhanced_detection import rag_enhancer
+from ensemble_detection import ensemble_system
+from knowledge_graph import knowledge_graph
+from analytics_service import analytics_service, PerformanceMetrics, SafetyMetrics, AIEnhancementStats
+from safety_service import safety_service, CollisionPrediction, SafetyAlert, EmergencyEvent
+from learning_service import learning_service, UserProfile, CustomObject
+import asyncio
+
 
 VEHICLE_LABELS = {"car", "truck", "bus", "motorcycle", "bicycle"}
 MOVING_SPEED_THRESHOLD_KMH = 1.8
@@ -36,7 +44,7 @@ MOVING_SPEED_THRESHOLD_KMH = 1.8
 # Default small model; override with CAR_VISION_YOLO_MODEL if needed.
 YOLO_MODEL_NAME = os.environ.get("CAR_VISION_YOLO_MODEL", "yolov8s.pt")
 # Higher = fewer false boxes (better label accuracy). Lower via env only if you need more recall on tiny/distant objects.
-YOLO_CONF = float(os.environ.get("CAR_VISION_YOLO_CONF", "0.38"))
+YOLO_CONF = float(os.environ.get("CAR_VISION_YOLO_CONF", "0.3"))
 YOLO_IOU = float(os.environ.get("CAR_VISION_YOLO_IOU", "0.5"))
 YOLO_MAX_DET = int(os.environ.get("CAR_VISION_YOLO_MAX_DET", "60"))
 YOLO_IMGSZ = int(os.environ.get("CAR_VISION_YOLO_IMGSZ", "640"))
@@ -61,10 +69,10 @@ CLASS_HISTORY_LEN = int(os.environ.get("CAR_VISION_CLASS_HISTORY", "7"))
 CLASS_SWITCH_AFTER = int(os.environ.get("CAR_VISION_CLASS_SWITCH_FRAMES", "3"))
 
 # Person false-positive suppression (handheld phone confused as person)
-PERSON_MIN_CONF_SMALL = float(os.environ.get("CAR_VISION_PERSON_MIN_CONF_SMALL", "0.62"))
-PERSON_MAX_AREA_FRAC_WEAK = float(os.environ.get("CAR_VISION_PERSON_MAX_AREA_FRAC", "0.0045"))
-PERSON_TALL_NARROW_AR = float(os.environ.get("CAR_VISION_PERSON_TALL_AR", "3.2"))
-PERSON_TALL_NARROW_MAX_CONF = float(os.environ.get("CAR_VISION_PERSON_TALL_MAX_CONF", "0.72"))
+PERSON_MIN_CONF_SMALL = float(os.environ.get("CAR_VISION_PERSON_MIN_CONF_SMALL", "0.35"))
+PERSON_MAX_AREA_FRAC_WEAK = float(os.environ.get("CAR_VISION_PERSON_MAX_AREA_FRAC", "0.001"))
+PERSON_TALL_NARROW_AR = float(os.environ.get("CAR_VISION_PERSON_TALL_AR", "4.5"))
+PERSON_TALL_NARROW_MAX_CONF = float(os.environ.get("CAR_VISION_PERSON_TALL_MAX_CONF", "0.55"))
 
 # IoU: if person overlaps cell phone and phone scores reasonably, drop person
 PHONE_PERSON_IOU = float(os.environ.get("CAR_VISION_PHONE_PERSON_IOU", "0.25"))
@@ -162,10 +170,39 @@ class CalibrationConfig(BaseModel):
     object_heights_m: Dict[str, float]
 
 
-class CalibrationPatch(BaseModel):
-    focal_like: Optional[float] = None
-    meters_per_px: Optional[float] = None
-    default_object_height_m: Optional[float] = None
+class LearningFeedback(BaseModel):
+    detection_result: Dict[str, Any]
+    ground_truth: Optional[Dict[str, Any]] = None
+    feedback_type: str  # 'false_positive', 'false_negative', 'correct', 'improve'
+    user_correction: Optional[str] = None
+
+class UserBehaviorData(BaseModel):
+    user_id: str
+    session_data: Dict[str, Any]
+
+class CustomObjectTraining(BaseModel):
+    user_id: str
+    object_name: str
+    training_images: List[str]
+
+class PersonalizedSettingsRequest(BaseModel):
+    user_id: str
+    context: Optional[Dict[str, Any]] = None
+
+class EmergencyContactRequest(BaseModel):
+    name: str
+    phone: str
+    email: Optional[str] = None
+    relationship: str = "emergency"
+    priority: int = 1
+
+class SafetyZoneRequest(BaseModel):
+    name: str
+    center_lat: float
+    center_lon: float
+    radius_m: float
+    zone_type: str = "general"
+    speed_limit: Optional[float] = None
 
 
 @dataclass
@@ -370,7 +407,7 @@ def compute_frame_diagnostics(frame: "np.ndarray") -> FrameDiagnostics:
     brightness_01 = float(np.clip(small.mean() / 255.0, 0.0, 1.0))
     texture_variance = float(np.var(small))
     bright_frac = float((small >= 235.0).mean())
-    low_light = brightness_01 < 0.11
+    low_light = brightness_01 < 0.18  # triggers at dusk/dim roads, not just pitch black
     # Hot pixels + smeared highlights (tail lamps / street lights) often sit on a flattened texture.
     glare_risk = bright_frac > 0.075 or (bright_frac > 0.038 and texture_variance < 11.0)
     low_contrast = texture_variance < 12.0
@@ -395,6 +432,61 @@ def compute_frame_diagnostics(frame: "np.ndarray") -> FrameDiagnostics:
         low_contrast=low_contrast,
         quality_hint=quality_hint,
     )
+
+
+def enhance_night_frame(frame: "np.ndarray", diagnostics: "FrameDiagnostics") -> "np.ndarray":
+    """
+    Night / low-light frame enhancement so YOLO can see vehicle bodies behind headlights.
+
+    Strategy:
+      1. Always run when low_light OR low_contrast (dark road scenes).
+      2. CLAHE per channel in LAB colour space — lifts dark regions without blowing out
+         already-bright areas (headlights stay bright, vehicle body becomes visible).
+      3. Highlight suppression — headlight halos are clipped so the surrounding pixels
+         (bumper, bonnet, bike frame) get more relative contrast.
+      4. Mild unsharp-mask sharpening — recovers edge detail lost to sensor noise.
+      5. When glare is also present (oncoming headlights), we reduce the CLAHE clip
+         limit so we don't amplify the bloom further.
+
+    Returns the enhanced frame (same shape/dtype as input).
+    """
+    import cv2  # OpenCV is bundled with ultralytics
+
+    if not (diagnostics.low_light or diagnostics.low_contrast):
+        return frame  # Daytime / well-lit — skip entirely
+
+    # --- 1. Convert to LAB so we only touch luminance ---
+    lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+
+    # --- 2. CLAHE on L channel ---
+    # Lower clip when glare is present to avoid amplifying headlight bloom.
+    clip = 1.5 if diagnostics.glare_risk else 3.0
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l_ch)
+
+    # --- 3. Highlight suppression ---
+    # Pixels already very bright (headlights, street lamps) are pulled back toward
+    # a softer ceiling so the vehicle body around them gains relative visibility.
+    if diagnostics.glare_risk:
+        # Blend: keep 60% of CLAHE result, pull 40% toward a soft ceiling of 220
+        ceiling = np.full_like(l_eq, 220, dtype=np.uint8)
+        l_eq = cv2.addWeighted(l_eq, 0.6, ceiling, 0.0, 0).clip(0, 255).astype(np.uint8)
+        # Soft-clip anything above 230 → compress to 230-245 range
+        bright_mask = l_eq > 230
+        l_eq[bright_mask] = (230 + (l_eq[bright_mask].astype(np.int32) - 230) // 3).clip(0, 245).astype(np.uint8)
+
+    # --- 4. Merge back and convert to RGB ---
+    lab_eq = cv2.merge([l_eq, a_ch, b_ch])
+    enhanced = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+
+    # --- 5. Unsharp mask — sharpens edges (bike frames, car outlines) ---
+    # Only when very dark; skip when glare is the main issue (sharpening halos = worse).
+    if diagnostics.low_light and not diagnostics.glare_risk:
+        blur = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2.0)
+        enhanced = cv2.addWeighted(enhanced, 1.4, blur, -0.4, 0)
+
+    return enhanced.astype(np.uint8)
 
 
 def bbox_iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -546,6 +638,172 @@ def resolve_person_cell_phone_conflicts(
     return [rows[i] for i in range(len(rows)) if i not in drop]
 
 
+def get_dynamic_yolo_params(diagnostics: Optional[FrameDiagnostics]) -> dict:
+    """
+    Dynamically adjust YOLO parameters based on scene conditions for better accuracy.
+    """
+    params = {
+        'conf': YOLO_CONF,
+        'iou': YOLO_IOU,
+        'max_det': YOLO_MAX_DET,
+        'imgsz': YOLO_IMGSZ,
+        'augment': YOLO_TTA,
+    }
+    
+    if diagnostics:
+        # Adjust confidence threshold based on scene quality
+        if diagnostics.low_light or diagnostics.low_contrast:
+            # Lower confidence in poor conditions to catch more objects
+            params['conf'] = max(0.15, YOLO_CONF * 0.85)
+        elif diagnostics.glare_risk:
+            # Higher confidence in glare to reduce false positives
+            params['conf'] = min(0.5, YOLO_CONF * 1.15)
+        
+        # Adjust IoU threshold for better separation in challenging conditions
+        if diagnostics.low_contrast:
+            # Lower IoU to separate overlapping objects better
+            params['iou'] = max(0.3, YOLO_IOU * 0.9)
+        
+        # Enable TTA (Test Time Augmentation) for challenging scenes
+        if diagnostics.low_light or diagnostics.glare_risk:
+            params['augment'] = True
+    
+    return params
+
+
+def fix_common_misclassifications(
+    rows: List[Tuple[str, float, Tuple[float, float, float, float]]],
+    frame_w: float,
+    frame_h: float
+) -> List[Tuple[str, float, Tuple[float, float, float, float]]]:
+    """
+    Fix common YOLO misclassifications based on size, position, and context.
+    
+    Common issues:
+    - Person detected as truck/car (when person fills most of frame)
+    - Small objects detected as large vehicles
+    - Indoor objects detected as vehicles
+    - Misclassified objects based on aspect ratio and position
+    """
+    fixed_rows = []
+    
+    # First pass: collect all labels for context analysis
+    all_labels = [row[0] for row in rows]
+    indoor_indicators = ['laptop', 'keyboard', 'mouse', 'book', 'cup', 'bottle', 'cell phone', 'tv', 'clock']
+    outdoor_indicators = ['car', 'truck', 'bus', 'motorcycle', 'bicycle', 'traffic light', 'stop sign']
+    
+    indoor_count = sum(1 for label in all_labels if label in indoor_indicators)
+    outdoor_count = sum(1 for label in all_labels if label in outdoor_indicators)
+    
+    # Determine likely environment context
+    likely_indoor = indoor_count > outdoor_count and indoor_count >= 2
+    likely_outdoor = outdoor_count > indoor_count and outdoor_count >= 1
+    
+    for label, conf, bbox in rows:
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+        area = width * height
+        aspect_ratio = width / max(height, 1)
+        
+        # Calculate relative size (fraction of frame)
+        area_fraction = area / (frame_w * frame_h)
+        width_fraction = width / frame_w
+        height_fraction = height / frame_h
+        
+        # Center position (normalized)
+        center_x = (x1 + x2) / 2 / frame_w
+        center_y = (y1 + y2) / 2 / frame_h
+        
+        original_label = label
+        
+        # Fix 1: Large objects detected as vehicles are likely persons
+        if label in ['truck', 'bus', 'car'] and area_fraction > 0.12:
+            # If object takes up >12% of frame, likely a person close to camera
+            if aspect_ratio < 2.2 and height_fraction > 0.3:  # Tall enough to be person
+                label = 'person'
+                conf *= 0.9  # Slightly reduce confidence for corrected label
+        
+        # Fix 2: Very small "vehicles" are likely other objects
+        elif label in ['truck', 'bus', 'car', 'motorcycle'] and area_fraction < 0.008:
+            # Tiny vehicles are suspicious - could be phones, books, etc.
+            if aspect_ratio > 1.8:
+                label = 'cell phone'  # Wide small object
+            elif aspect_ratio < 0.8:
+                label = 'book'  # Tall small object
+            else:
+                label = 'mouse'  # Square small object
+            conf *= 0.75
+        
+        # Fix 3: Tall narrow "vehicles" are likely persons
+        elif label in ['truck', 'bus', 'car'] and aspect_ratio < 0.65:
+            # Tall narrow objects are usually people
+            if height_fraction > 0.25:  # Must be reasonably tall
+                label = 'person'
+                conf *= 0.85
+        
+        # Fix 4: Objects in center of frame with high area are likely persons
+        elif label in ['truck', 'bus'] and area_fraction > 0.06:
+            if 0.25 < center_x < 0.75 and 0.15 < center_y < 0.85:  # Centered
+                if aspect_ratio < 1.8:  # Not too wide
+                    label = 'person'
+                    conf *= 0.9
+        
+        # Fix 5: Very wide objects detected as persons are likely vehicles
+        elif label == 'person' and aspect_ratio > 2.8 and area_fraction < 0.15:
+            # Wide, not too large = likely a car
+            if likely_outdoor or outdoor_count > 0:
+                label = 'car'
+                conf *= 0.8
+        
+        # Fix 6: Indoor context - vehicles indoors are suspicious
+        if label in ['truck', 'bus', 'car', 'motorcycle'] and likely_indoor:
+            # We're clearly indoors, vehicles are suspicious
+            if area_fraction > 0.08:  # Large "vehicle" indoors = person
+                label = 'person'
+                conf *= 0.7
+            elif area_fraction < 0.025:  # Small "vehicle" indoors = object
+                if aspect_ratio > 1.5:
+                    label = 'cell phone'
+                else:
+                    label = 'laptop' if area_fraction > 0.01 else 'mouse'
+                conf *= 0.6
+        
+        # Fix 7: Motorcycle/bicycle confusion with person
+        elif label in ['motorcycle', 'bicycle'] and area_fraction > 0.1:
+            if aspect_ratio < 1.2 and likely_indoor:  # Tall object indoors
+                label = 'person'
+                conf *= 0.8
+        
+        # Fix 8: Person detected as small vehicle (common with partial person in frame)
+        elif label in ['motorcycle', 'bicycle'] and area_fraction < 0.03:
+            if aspect_ratio < 1.5:  # Not too wide
+                label = 'person'
+                conf *= 0.85
+        
+        # Fix 9: Position-based corrections for edge cases
+        if label in ['truck', 'bus']:
+            # Very top or bottom of frame "trucks" are often misclassified
+            if center_y < 0.15 or center_y > 0.85:
+                if area_fraction < 0.05:
+                    label = 'car'  # Smaller vehicle more likely
+                    conf *= 0.8
+        
+        # Fix 10: Confidence-based corrections
+        if conf < 0.4:  # Low confidence detections need stricter rules
+            if label in ['truck', 'bus'] and area_fraction < 0.02:
+                continue  # Skip very small, low-confidence large vehicles
+            elif label in ['car', 'motorcycle'] and area_fraction > 0.2:
+                label = 'person'  # Large, low-confidence vehicles = person
+                conf *= 0.7
+        
+        # Only keep if confidence is still reasonable after corrections
+        if conf >= 0.12:  # Minimum confidence threshold (lowered slightly)
+            fixed_rows.append((label, conf, bbox))
+    
+    return fixed_rows
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -614,7 +872,9 @@ def trip_reset() -> dict:
 
 
 @app.post("/analyze-image", response_model=AnalyzeResponse)
-async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
+async def analyze_image(file: UploadFile = File(...), user_id: str = "default", 
+                       location_lat: float = None, location_lon: float = None,
+                       user_speed: float = 0.0, acceleration: float = 0.0) -> AnalyzeResponse:
     now_s = time.time()
     if np is None or Image is None:
         return AnalyzeResponse(frame_time_s=now_s, detections=[], trip=trip_snapshot(now_s))
@@ -625,6 +885,10 @@ async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
     fh, fw = float(frame.shape[0]), float(frame.shape[1])
     diagnostics = compute_frame_diagnostics(frame)
 
+    # Night / low-light enhancement: lift dark vehicle bodies, suppress headlight halos.
+    # Runs automatically when the scene is dark or low-contrast; no-op in daylight.
+    frame = enhance_night_frame(frame, diagnostics)
+
     if MODEL is None:
         return AnalyzeResponse(
             frame_time_s=now_s,
@@ -633,14 +897,28 @@ async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
             frame_diagnostics=diagnostics,
         )
 
+    # Get personalized settings for this user
+    user_location = (location_lat, location_lon) if location_lat and location_lon else None
+    context = {
+        'weather': diagnostics.quality_hint if diagnostics else 'unknown',
+        'hour': int((now_s % 86400) / 3600),
+        'lighting': 'night' if diagnostics and diagnostics.low_light else 'day'
+    }
+    
+    personalized_settings = learning_service.get_personalized_settings(user_id, context)
+    environment_adaptations = learning_service.adapt_to_environment(user_id, context)
+
+    # Get dynamic YOLO parameters based on scene conditions and user preferences
+    yolo_params = get_dynamic_yolo_params(diagnostics)
+    
+    # Apply personalized sensitivity adjustments
+    if 'confidence_threshold' in environment_adaptations:
+        yolo_params['conf'] = environment_adaptations['confidence_threshold']
+    
     results = MODEL.predict(
         frame,
         verbose=False,
-        conf=YOLO_CONF,
-        iou=YOLO_IOU,
-        max_det=YOLO_MAX_DET,
-        imgsz=YOLO_IMGSZ,
-        augment=YOLO_TTA,
+        **yolo_params
     )
 
     raw_rows: List[Tuple[str, float, Tuple[float, float, float, float]]] = []
@@ -653,6 +931,12 @@ async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
             conf = float(b.conf[0].item())
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
             bbox = (x1, y1, x2, y2)
+            
+            # Apply personalized sensitivity filtering
+            user_sensitivity = personalized_settings.get('sensitivity', {}).get(label, 0.5)
+            if conf < user_sensitivity:
+                continue
+                
             if not DISABLE_PERSON_FP_FILTER and not person_false_positive_filter(label, conf, bbox, fw, fh):
                 continue
             if not keep_detection_for_ride_mount(label, bbox, fh):
@@ -660,12 +944,78 @@ async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
             raw_rows.append((label, conf, bbox))
 
     raw_rows = resolve_person_cell_phone_conflicts(raw_rows)
+    
+    # Apply misclassification fixes based on size, position, and context
+    raw_rows = fix_common_misclassifications(raw_rows, fw, fh)
 
+    # Convert to detection dictionaries for advanced processing
+    initial_detections = []
+    for label, conf, bbox in raw_rows:
+        initial_detections.append({
+            "label": label,
+            "confidence": conf,
+            "bbox_xyxy": list(bbox)
+        })
+
+    # === ADVANCED RAG & AI ENHANCEMENT PIPELINE ===
+    
+    # Step 1: RAG-Enhanced Detection Analysis
+    rag_enhanced_detections = rag_enhancer.enhance_detections_with_rag(
+        initial_detections, 
+        diagnostics.__dict__ if diagnostics else {}
+    )
+    
+    # Step 2: Knowledge Graph Contextual Analysis
+    scene_context = "indoor" if any(d.get("label") in ["laptop", "keyboard", "tv"] for d in rag_enhanced_detections) else "outdoor"
+    kg_analysis = knowledge_graph.analyze_detection_context(rag_enhanced_detections, scene_context)
+    
+    # Apply knowledge graph corrections
+    kg_corrected_detections = []
+    for detection in rag_enhanced_detections:
+        corrected = detection.copy()
+        
+        # Apply confidence adjustments from knowledge graph
+        obj_type = detection.get("label", "")
+        if obj_type in kg_analysis["confidence_adjustments"]:
+            adj_factor = kg_analysis["confidence_adjustments"][obj_type]
+            corrected["confidence"] = min(0.99, corrected["confidence"] * adj_factor)
+        
+        # Apply suggested corrections
+        for suggestion in kg_analysis["suggested_corrections"]:
+            if (suggestion["action"] == "relabel_detection" and 
+                suggestion["current_label"] == obj_type and
+                suggestion["confidence"] > 0.7):
+                corrected["label"] = suggestion["suggested_label"]
+                corrected["confidence"] *= 0.9  # Slight confidence reduction for corrections
+                corrected["kg_correction"] = suggestion["reason"]
+        
+        kg_corrected_detections.append(corrected)
+    
+    # Step 3: Ensemble Detection (if enabled)
+    try:
+        ensemble_result = await ensemble_system.ensemble_detect(frame, MODEL, diagnostics.__dict__ if diagnostics else {})
+        final_enhanced_detections = ensemble_result.final_detections
+        
+        # Add ensemble metadata
+        for detection in final_enhanced_detections:
+            detection["ensemble_consensus"] = ensemble_result.consensus_strength
+            detection["model_agreement"] = ensemble_result.model_agreements.get("overall", 1.0)
+            
+    except Exception as e:
+        # Fallback to knowledge graph corrected detections if ensemble fails
+        print(f"Ensemble detection failed: {e}")
+        final_enhanced_detections = kg_corrected_detections
+
+    # Convert back to the original pipeline format
     out: List[DetectionOut] = []
     global NEXT_ID
 
-    for label, conf, bbox in raw_rows:
-        cx, cy = centroid(bbox)
+    for detection in final_enhanced_detections:
+        label = detection.get("label", "")
+        conf = detection.get("confidence", 0.5)
+        bbox = detection.get("bbox_xyxy", [0, 0, 100, 100])
+        
+        cx, cy = centroid(tuple(bbox))
         tid = match_track(cx, cy, now_s, fw, fh)
         if tid is None:
             tid = NEXT_ID
@@ -678,38 +1028,438 @@ async def analyze_image(file: UploadFile = File(...)) -> AnalyzeResponse:
         is_moving = speed_kmh_raw >= MOVING_SPEED_THRESHOLD_KMH
         speed_kmh = speed_kmh_raw if is_moving else 0.0
         smooth_label, smooth_conf = smooth_label_from_history(tid, label, conf)
-        distance_m = estimate_distance_m(smooth_label, bbox, fw, fh)
+        distance_m = estimate_distance_m(smooth_label, tuple(bbox), fw, fh)
 
         if smooth_label in VEHICLE_LABELS and is_moving:
             ttc_s, risk = ttc_and_risk(distance_m, speed_kmh)
+        elif smooth_label == "person":
+            # Static person still gets a proximity-based risk so they appear in the HUD
+            risk = max(0.0, min(60.0, (1.0 - distance_m / 10.0) * 60.0)) if distance_m < 10.0 else 5.0
+            ttc_s = 999.0
         else:
             ttc_s, risk = 999.0, 0.0
 
         x1, y1, x2, y2 = bbox
-        out.append(
-            DetectionOut(
-                track_id=tid,
-                label=smooth_label,
-                confidence=smooth_conf,
-                bbox_xyxy=[x1, y1, x2, y2],
-                distance_m=distance_m,
-                speed_kmh=speed_kmh,
-                is_moving=is_moving,
-                ttc_s=ttc_s,
-                risk_percent=risk,
-                track_age_s=track_age_s,
-            )
+        detection_out = DetectionOut(
+            track_id=tid,
+            label=smooth_label,
+            confidence=smooth_conf,
+            bbox_xyxy=[x1, y1, x2, y2],
+            distance_m=distance_m,
+            speed_kmh=speed_kmh,
+            is_moving=is_moving,
+            ttc_s=ttc_s,
+            risk_percent=risk,
+            track_age_s=track_age_s,
         )
+        
+        # Add AI enhancement metadata
+        if hasattr(detection_out, '__dict__'):
+            detection_out.__dict__.update({
+                "ai_enhanced": True,
+                "rag_metadata": detection.get("rag_metadata", {}),
+                "kg_analysis": kg_analysis.get("context_consistency", {}).get(smooth_label, 0.5),
+                "ensemble_data": {
+                    "consensus": detection.get("ensemble_consensus", 1.0),
+                    "agreement": detection.get("model_agreement", 1.0)
+                } if "ensemble_consensus" in detection else None
+            })
+        
+        out.append(detection_out)
 
     out.sort(key=lambda d: d.confidence, reverse=True)
+    
+    # === SAFETY AND ANALYTICS INTEGRATION ===
+    
+    # Record detections for analytics
+    for detection_out in out:
+        detection_dict = {
+            'label': detection_out.label,
+            'confidence': detection_out.confidence,
+            'distance_m': detection_out.distance_m,
+            'speed_kmh': detection_out.speed_kmh,
+            'risk_percent': detection_out.risk_percent,
+            'user_id': user_id
+        }
+        
+        analytics_service.record_detection(
+            detection_dict, 
+            ai_enhanced=True,
+            correction_type="ensemble_rag_kg",
+            scene_context=scene_context
+        )
+    
+    # Check for collision predictions and safety alerts
+    collision_predictions = safety_service.predict_collision(
+        [asdict(d) for d in out], user_speed, user_location
+    )
+    
+    # Check for emergency conditions
+    emergency_event = safety_service.check_emergency_conditions(
+        [asdict(d) for d in out], user_speed, acceleration, user_location
+    )
+    
+    # Create safety alerts for high-risk situations
+    for detection_out in out:
+        if detection_out.risk_percent > 80:
+            safety_service.create_safety_alert(
+                alert_type="collision_warning",
+                severity="HIGH" if detection_out.risk_percent > 90 else "MEDIUM",
+                message=f"High risk {detection_out.label} detected at {detection_out.distance_m:.1f}m",
+                object_involved=asdict(detection_out),
+                auto_dismiss_seconds=10
+            )
+    
+    # Record safety events for high-risk detections
+    for detection_out in out:
+        if detection_out.risk_percent > 75:
+            analytics_service.record_safety_event(
+                event_type="high_risk_detection",
+                severity="DANGER" if detection_out.risk_percent > 90 else "CAUTION",
+                detection=asdict(detection_out),
+                weather=context.get('weather', 'unknown'),
+                lighting=context.get('lighting', 'unknown'),
+                location=user_location
+            )
+    
     update_trip_stats(out, now_s)
-    return AnalyzeResponse(
+    
+    # Enhanced response with AI metadata and safety information
+    response = AnalyzeResponse(
         frame_time_s=now_s,
         detections=out,
         trip=trip_snapshot(now_s),
         frame_diagnostics=diagnostics,
     )
+    
+    # Add comprehensive enhancement summary to response
+    if hasattr(response, '__dict__'):
+        response.__dict__.update({
+            "ai_enhancements": {
+                "rag_corrections": len([d for d in final_enhanced_detections if "rag_metadata" in d]),
+                "kg_corrections": len(kg_analysis["suggested_corrections"]),
+                "relationship_violations": len(kg_analysis["relationship_violations"]),
+                "ensemble_enabled": "ensemble_consensus" in (final_enhanced_detections[0] if final_enhanced_detections else {}),
+                "scene_context": scene_context,
+                "processing_pipeline": ["yolo", "personalization", "rag", "knowledge_graph", "ensemble", "temporal_smoothing"]
+            },
+            "safety_analysis": {
+                "collision_predictions": len(collision_predictions),
+                "emergency_event": emergency_event.event_id if emergency_event else None,
+                "active_alerts": len(safety_service.get_active_alerts()),
+                "personalized_settings_applied": True
+            },
+            "personalization": {
+                "user_id": user_id,
+                "settings_applied": personalized_settings,
+                "environment_adaptations": environment_adaptations
+            }
+        })
+    
+    return response
 
+
+@app.get("/ai-insights")
+def get_ai_insights() -> dict:
+    """Get insights from AI enhancement systems"""
+    try:
+        # Get RAG learning insights
+        rag_insights = rag_enhancer.get_learning_insights()
+        
+        # Get knowledge graph statistics
+        kg_stats = {
+            "total_nodes": len(knowledge_graph.object_nodes),
+            "total_relationships": len(knowledge_graph.relationships),
+            "exclusion_rules": len(knowledge_graph.exclusion_matrix)
+        }
+        
+        # Get ensemble performance metrics
+        ensemble_metrics = {
+            "temporal_tracking_active": len(ensemble_system.temporal_tracker.object_histories),
+            "adaptive_learning_patterns": len(ensemble_system.adaptive_learner.performance_history),
+            "model_weights": ensemble_system.model_weights
+        }
+        
+        return {
+            "ok": True,
+            "rag_insights": rag_insights,
+            "knowledge_graph_stats": kg_stats,
+            "ensemble_metrics": ensemble_metrics,
+            "ai_features_active": {
+                "rag_enhancement": True,
+                "knowledge_graph": True,
+                "ensemble_detection": True,
+                "temporal_consistency": True,
+                "adaptive_learning": True
+            }
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "ai_features_active": {
+                "rag_enhancement": False,
+                "knowledge_graph": False,
+                "ensemble_detection": False,
+                "temporal_consistency": False,
+                "adaptive_learning": False
+            }
+        }
+
+@app.post("/ai-feedback")
+def submit_ai_feedback(feedback: LearningFeedback) -> dict:
+    """Submit feedback for AI learning systems"""
+    try:
+        # Record feedback for adaptive learning
+        if feedback.detection_result and feedback.ground_truth:
+            ensemble_system.adaptive_learner.record_detection_result(
+                feedback.detection_result,
+                feedback.ground_truth
+            )
+        
+        # Record in learning service
+        learning_service.record_detection_feedback(
+            user_id=feedback.detection_result.get('user_id', 'default'),
+            detection=feedback.detection_result,
+            user_correction=feedback.user_correction or '',
+            feedback_type=feedback.feedback_type
+        )
+        
+        return {"ok": True, "message": "Feedback recorded for AI learning"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# === ANALYTICS ENDPOINTS ===
+
+@app.get("/analytics/performance")
+def get_performance_analytics(hours: int = 24) -> dict:
+    """Get comprehensive performance analytics"""
+    try:
+        metrics = analytics_service.get_performance_metrics(hours)
+        return {
+            "ok": True,
+            "performance_metrics": asdict(metrics),
+            "time_period_hours": hours
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/analytics/safety")
+def get_safety_analytics(hours: int = 24) -> dict:
+    """Get safety metrics and trends"""
+    try:
+        metrics = analytics_service.get_safety_metrics(hours)
+        return {
+            "ok": True,
+            "safety_metrics": asdict(metrics),
+            "time_period_hours": hours
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/analytics/ai-enhancements")
+def get_ai_enhancement_analytics(hours: int = 24) -> dict:
+    """Get AI enhancement statistics"""
+    try:
+        stats = analytics_service.get_ai_enhancement_stats(hours)
+        return {
+            "ok": True,
+            "ai_enhancement_stats": asdict(stats),
+            "time_period_hours": hours
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/analytics/trends")
+def get_historical_trends(days: int = 7) -> dict:
+    """Get historical trends for charts and graphs"""
+    try:
+        trends = analytics_service.get_historical_trends(days)
+        return {
+            "ok": True,
+            "trends": trends,
+            "time_period_days": days
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/analytics/trip/start")
+def start_trip_analytics(user_id: str = "default") -> dict:
+    """Start a new trip for analytics tracking"""
+    try:
+        trip_id = analytics_service.start_trip(user_id)
+        return {
+            "ok": True,
+            "trip_id": trip_id,
+            "message": "Trip analytics started"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/analytics/trip/end")
+def end_trip_analytics(trip_id: str = None) -> dict:
+    """End current trip and get analytics"""
+    try:
+        trip_analytics = analytics_service.end_trip(trip_id)
+        if trip_analytics:
+            return {
+                "ok": True,
+                "trip_analytics": asdict(trip_analytics)
+            }
+        else:
+            return {"ok": False, "error": "Trip not found"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# === SAFETY ENDPOINTS ===
+
+@app.get("/safety/alerts")
+def get_active_safety_alerts() -> dict:
+    """Get all active safety alerts"""
+    try:
+        alerts = safety_service.get_active_alerts()
+        return {
+            "ok": True,
+            "alerts": [asdict(alert) for alert in alerts]
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/safety/alerts/{alert_id}/dismiss")
+def dismiss_safety_alert(alert_id: str) -> dict:
+    """Dismiss a safety alert"""
+    try:
+        success = safety_service.dismiss_alert(alert_id)
+        return {
+            "ok": success,
+            "message": "Alert dismissed" if success else "Alert not found"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/safety/emergency-contact")
+def add_emergency_contact(contact: EmergencyContactRequest) -> dict:
+    """Add an emergency contact"""
+    try:
+        contact_id = safety_service.add_emergency_contact(
+            name=contact.name,
+            phone=contact.phone,
+            email=contact.email,
+            relationship=contact.relationship,
+            priority=contact.priority
+        )
+        return {
+            "ok": True,
+            "contact_id": contact_id,
+            "message": "Emergency contact added"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/safety/zone")
+def add_safety_zone(zone: SafetyZoneRequest) -> dict:
+    """Add a safety zone"""
+    try:
+        zone_id = safety_service.add_safety_zone(
+            name=zone.name,
+            center=(zone.center_lat, zone.center_lon),
+            radius_m=zone.radius_m,
+            zone_type=zone.zone_type,
+            speed_limit=zone.speed_limit
+        )
+        return {
+            "ok": True,
+            "zone_id": zone_id,
+            "message": "Safety zone added"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/safety/recommendations")
+def get_safety_recommendations(user_id: str = "default") -> dict:
+    """Get personalized safety recommendations"""
+    try:
+        recommendations = analytics_service.generate_safety_recommendations(user_id)
+        return {
+            "ok": True,
+            "recommendations": recommendations
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# === LEARNING & PERSONALIZATION ENDPOINTS ===
+
+@app.post("/learning/user-profile")
+def create_user_profile(user_id: str, mobility_mode: str = "cycling") -> dict:
+    """Create a new user profile"""
+    try:
+        profile = learning_service.create_user_profile(user_id, mobility_mode)
+        return {
+            "ok": True,
+            "profile": asdict(profile),
+            "message": "User profile created"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/learning/behavior")
+def learn_user_behavior(behavior_data: UserBehaviorData) -> dict:
+    """Submit user behavior data for learning"""
+    try:
+        learning_service.learn_user_behavior(
+            behavior_data.user_id,
+            behavior_data.session_data
+        )
+        return {
+            "ok": True,
+            "message": "Behavior data processed for learning"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/learning/custom-object")
+def train_custom_object(training_request: CustomObjectTraining) -> dict:
+    """Train a custom object detector"""
+    try:
+        custom_object = learning_service.train_custom_object(
+            training_request.user_id,
+            training_request.object_name,
+            training_request.training_images
+        )
+        return {
+            "ok": True,
+            "custom_object": asdict(custom_object),
+            "message": "Custom object training completed"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/learning/personalized-settings")
+def get_personalized_settings(request: PersonalizedSettingsRequest) -> dict:
+    """Get personalized detection settings for user"""
+    try:
+        settings = learning_service.get_personalized_settings(
+            request.user_id,
+            request.context
+        )
+        return {
+            "ok": True,
+            "settings": settings
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/learning/environment-adaptation")
+def adapt_to_environment(user_id: str, environment_data: dict) -> dict:
+    """Get environment-adapted detection parameters"""
+    try:
+        adaptations = learning_service.adapt_to_environment(user_id, environment_data)
+        return {
+            "ok": True,
+            "adaptations": adaptations
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def io_bytes(raw: bytes):
     import io
