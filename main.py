@@ -49,6 +49,7 @@ from knowledge_graph import knowledge_graph
 from analytics_service import analytics_service, PerformanceMetrics, SafetyMetrics, AIEnhancementStats
 from safety_service import safety_service, CollisionPrediction, SafetyAlert, EmergencyEvent
 from learning_service import learning_service, UserProfile, CustomObject
+from performance_controller import router as performance_router, should_skip_heavy_processing, should_use_rag, should_use_knowledge_graph, should_use_ensemble, should_use_learning, get_yolo_params
 import asyncio
 
 
@@ -112,6 +113,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include performance router
+app.include_router(performance_router)
 
 
 class DetectionOut(BaseModel):
@@ -938,12 +942,17 @@ async def analyze_image(file: UploadFile = File(...), user_id: str = "default",
     personalized_settings = learning_service.get_personalized_settings(user_id, context)
     environment_adaptations = learning_service.adapt_to_environment(user_id, context)
 
-    # Get dynamic YOLO parameters based on scene conditions and user preferences
-    yolo_params = get_dynamic_yolo_params(diagnostics)
-    
-    # Apply personalized sensitivity adjustments
-    if 'confidence_threshold' in environment_adaptations:
-        yolo_params['conf'] = environment_adaptations['confidence_threshold']
+    # Get dynamic YOLO parameters based on scene conditions and performance mode
+    if should_skip_heavy_processing():
+        # Ultra-fast mode - use optimized parameters
+        yolo_params = get_yolo_params()
+    else:
+        # Heavy AI mode - use dynamic parameters
+        yolo_params = get_dynamic_yolo_params(diagnostics)
+        
+        # Apply personalized sensitivity adjustments in heavy mode
+        if 'confidence_threshold' in environment_adaptations:
+            yolo_params['conf'] = environment_adaptations['confidence_threshold']
     
     results = MODEL.predict(
         frame,
@@ -989,52 +998,75 @@ async def analyze_image(file: UploadFile = File(...), user_id: str = "default",
 
     # === ADVANCED RAG & AI ENHANCEMENT PIPELINE ===
     
-    # Step 1: RAG-Enhanced Detection Analysis
-    rag_enhanced_detections = rag_enhancer.enhance_detections_with_rag(
-        initial_detections, 
-        diagnostics.__dict__ if diagnostics else {}
-    )
-    
-    # Step 2: Knowledge Graph Contextual Analysis
-    scene_context = "indoor" if any(d.get("label") in ["laptop", "keyboard", "tv"] for d in rag_enhanced_detections) else "outdoor"
-    kg_analysis = knowledge_graph.analyze_detection_context(rag_enhanced_detections, scene_context)
-    
-    # Apply knowledge graph corrections
-    kg_corrected_detections = []
-    for detection in rag_enhanced_detections:
-        corrected = detection.copy()
+    # Check if we should skip heavy processing for ultra-fast mode
+    if should_skip_heavy_processing():
+        # Ultra-fast mode - skip all heavy AI processing
+        final_enhanced_detections = []
+        for label, conf, bbox in raw_rows:
+            final_enhanced_detections.append({
+                "label": label,
+                "confidence": conf,
+                "bbox_xyxy": list(bbox)
+            })
+    else:
+        # Heavy AI mode - run all enhancement layers
         
-        # Apply confidence adjustments from knowledge graph
-        obj_type = detection.get("label", "")
-        if obj_type in kg_analysis["confidence_adjustments"]:
-            adj_factor = kg_analysis["confidence_adjustments"][obj_type]
-            corrected["confidence"] = min(0.99, corrected["confidence"] * adj_factor)
+        # Step 1: RAG-Enhanced Detection Analysis (only if enabled)
+        if should_use_rag():
+            rag_enhanced_detections = rag_enhancer.enhance_detections_with_rag(
+                initial_detections, 
+                diagnostics.__dict__ if diagnostics else {}
+            )
+        else:
+            rag_enhanced_detections = initial_detections
         
-        # Apply suggested corrections
-        for suggestion in kg_analysis["suggested_corrections"]:
-            if (suggestion["action"] == "relabel_detection" and 
-                suggestion["current_label"] == obj_type and
-                suggestion["confidence"] > 0.7):
-                corrected["label"] = suggestion["suggested_label"]
-                corrected["confidence"] *= 0.9  # Slight confidence reduction for corrections
-                corrected["kg_correction"] = suggestion["reason"]
-        
-        kg_corrected_detections.append(corrected)
-    
-    # Step 3: Ensemble Detection (if enabled)
-    try:
-        ensemble_result = await ensemble_system.ensemble_detect(frame, MODEL, diagnostics.__dict__ if diagnostics else {})
-        final_enhanced_detections = ensemble_result.final_detections
-        
-        # Add ensemble metadata
-        for detection in final_enhanced_detections:
-            detection["ensemble_consensus"] = ensemble_result.consensus_strength
-            detection["model_agreement"] = ensemble_result.model_agreements.get("overall", 1.0)
+        # Step 2: Knowledge Graph Contextual Analysis (only if enabled)
+        if should_use_knowledge_graph():
+            scene_context = "indoor" if any(d.get("label") in ["laptop", "keyboard", "tv"] for d in rag_enhanced_detections) else "outdoor"
+            kg_analysis = knowledge_graph.analyze_detection_context(rag_enhanced_detections, scene_context)
             
-    except Exception as e:
-        # Fallback to knowledge graph corrected detections if ensemble fails
-        print(f"Ensemble detection failed: {e}")
-        final_enhanced_detections = kg_corrected_detections
+            # Apply knowledge graph corrections
+            kg_corrected_detections = []
+            for detection in rag_enhanced_detections:
+                corrected = detection.copy()
+                
+                # Apply confidence adjustments from knowledge graph
+                obj_type = detection.get("label", "")
+                if obj_type in kg_analysis["confidence_adjustments"]:
+                    adj_factor = kg_analysis["confidence_adjustments"][obj_type]
+                    corrected["confidence"] = min(0.99, corrected["confidence"] * adj_factor)
+                
+                # Apply suggested corrections
+                for suggestion in kg_analysis["suggested_corrections"]:
+                    if (suggestion["action"] == "relabel_detection" and 
+                        suggestion["current_label"] == obj_type and
+                        suggestion["confidence"] > 0.7):
+                        corrected["label"] = suggestion["suggested_label"]
+                        corrected["confidence"] *= 0.9  # Slight confidence reduction for corrections
+                        corrected["kg_correction"] = suggestion["reason"]
+                
+                kg_corrected_detections.append(corrected)
+        else:
+            kg_corrected_detections = rag_enhanced_detections
+            kg_analysis = {"confidence_adjustments": {}, "context_consistency": {}}
+        
+        # Step 3: Ensemble Detection (if enabled)
+        if should_use_ensemble():
+            try:
+                ensemble_result = await ensemble_system.ensemble_detect(frame, MODEL, diagnostics.__dict__ if diagnostics else {})
+                final_enhanced_detections = ensemble_result.final_detections
+                
+                # Add ensemble metadata
+                for detection in final_enhanced_detections:
+                    detection["ensemble_consensus"] = ensemble_result.consensus_strength
+                    detection["model_agreement"] = ensemble_result.model_agreements.get("overall", 1.0)
+                    
+            except Exception as e:
+                # Fallback to knowledge graph corrected detections if ensemble fails
+                print(f"Ensemble detection failed: {e}")
+                final_enhanced_detections = kg_corrected_detections
+        else:
+            final_enhanced_detections = kg_corrected_detections
 
     # Convert back to the original pipeline format
     out: List[DetectionOut] = []

@@ -1,0 +1,21 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.performance"
+
+[deploy]
+startCommand = "python start_with_performance_toggle.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[environments.production.variables]
+CAR_VISION_ULTRA_FAST = "1"
+CAR_VISION_YOLO_MODEL = "yolov8n.pt"
+CAR_VISION_YOLO_CONF = "0.4"
+CAR_VISION_YOLO_IOU = "0.6"
+CAR_VISION_YOLO_MAX_DET = "20"
+CAR_VISION_YOLO_IMGSZ = "416"
+CAR_VISION_YOLO_TTA = "false"
+DEPLOYMENT_ENV = "railway"
+PYTHONUNBUFFERED = "1"

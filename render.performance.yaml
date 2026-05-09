@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: car-vision-backend-performance
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python start_with_performance_toggle.py
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: CAR_VISION_ULTRA_FAST
+        value: "1"
+      - key: CAR_VISION_YOLO_MODEL
+        value: "yolov8n.pt"
+      - key: CAR_VISION_YOLO_CONF
+        value: "0.4"
+      - key: CAR_VISION_YOLO_IOU
+        value: "0.6"
+      - key: CAR_VISION_YOLO_MAX_DET
+        value: "20"
+      - key: CAR_VISION_YOLO_IMGSZ
+        value: "416"
+      - key: CAR_VISION_YOLO_TTA
+        value: "false"
+      - key: DEPLOYMENT_ENV
+        value: "render"
+      - key: PYTHONUNBUFFERED
+        value: "1"
